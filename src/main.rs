@@ -20,8 +20,11 @@ use sha2::{
 use std::{fmt, io::Write, str};
 
 fn main() {
-    let work = Status::new(6);
-    println!("p: {:#?}", work);
+    let mut work = Status::new(6);
+    // println!("p: {:#?}", work);
+
+    work.swap();
+    work.final_check();
 }
 
 /// All flash operations happen in terms of a given page size.  The page will be at least as large
@@ -53,7 +56,7 @@ struct Page {
 
 /// Flash state of a given page.  The idea is to fail an operation if the page is partially
 /// operated on, and we make use of the data in it.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 enum PageState {
     Written,
     Erased,
@@ -70,7 +73,8 @@ struct PageLocation {
 /// in memory.
 #[derive(Debug)]
 struct Status {
-    slots: [Slot; 2],
+    slot0: Slot,
+    slot1: Slot,
     root: Vec<u8>,
     parity: Vec<u8>,
 }
@@ -97,11 +101,58 @@ impl Page {
         }
     }
 
+    /// Verify that the contents of a page is as expected.
+    fn check(&self, loc: PageLocation) {
+        // TODO: This isn't very efficient.
+        let expected = Page::new(Some(loc));
+
+        if self.pstate != expected.pstate {
+            panic!("Page state is incorrect");
+        }
+
+        if &self.payload[..] != &expected.payload[..] {
+            panic!("Page contents is incorrect");
+        }
+    }
+
     /// Compute the digest of the given page.
     fn digest(&self) -> Vec<u8> {
         let mut md = Sha256::new();
         md.update(&self.payload);
         md.finalize().to_vec()
+    }
+
+    /// Normal read from the page. If the page is not in a state where this makes sense, it will
+    /// abort with a failure.
+    fn read(&self, buffer: &mut [u8]) {
+        match self.pstate {
+            PageState::Written => {
+                buffer.copy_from_slice(&self.payload);
+            }
+            _ => panic!("Invalid state for read"),
+        }
+    }
+
+    /// Safe read from the page. Reads from flash without regard to the state. We should never
+    /// depend on the value read here.
+    fn read_whatever(&self, buffer: &mut [u8]) {
+        buffer.copy_from_slice(&self.payload);
+    }
+
+    /// Erase the contents of the page.
+    fn erase(&mut self) {
+        self.pstate = PageState::Erased;
+        self.payload.fill(0xFF);
+    }
+
+    /// Write new contents to the page.  Will panic if the data isn't freshly erased.
+    fn write(&mut self, buffer: &[u8]) {
+        if let PageState::Erased = self.pstate {
+            self.payload.copy_from_slice(buffer);
+            self.pstate = PageState::Written;
+        } else {
+            panic!("Attempt to write to unerased flash page");
+        }
     }
 }
 
@@ -150,10 +201,41 @@ impl Slot {
 
 impl Status {
     fn new(size: usize) -> Status {
-        let slots = [Slot::new(0, size), Slot::new(1, size)];
-        let root = slots[1].compute_root();
-        let parity = slots[0].compute_parity();
+        let slot0 = Slot::new(0, size);
+        let slot1 = Slot::new(1, size);
+        let root = slot1.compute_root();
+        let parity = slot0.compute_parity();
 
-        Status { slots, root, parity }
+        Status { slot0, slot1, root, parity }
+    }
+
+    fn swap(&mut self) {
+        // TODO: Support different sizes for the slots.
+        assert_eq!(self.slot0.data.len(), self.slot1.data.len());
+
+        // We need two buffers for the operation.
+        let mut abuf = vec![0u8; PAGE_SIZE];
+        let mut bbuf = vec![0u8; PAGE_SIZE];
+
+        for sec in 0 .. self.slot0.data.len() {
+            let slot0 = &mut self.slot0.data[sec];
+            let slot1 = &mut self.slot1.data[sec];
+
+            slot0.read(&mut abuf);
+            slot1.read(&mut bbuf);
+
+            slot0.erase();
+            slot0.write(&mut bbuf);
+            slot1.erase();
+            slot1.write(&mut abuf);
+        }
+    }
+
+    /// Compute a final check to ensure that the given swap has completed.
+    fn final_check(&self) {
+        for sec in 0 .. self.slot0.data.len() {
+            self.slot0.data[sec].check(PageLocation { slot: 1, index: sec });
+            self.slot1.data[sec].check(PageLocation { slot: 0, index: sec });
+        }
     }
 }
