@@ -14,17 +14,19 @@
 // Turn this off once more code is written.
 #![allow(dead_code)]
 
-use sha2::{
-    Digest, Sha256,
-};
+use byteorder::{LittleEndian, WriteBytesExt};
+use sha2::{Digest, Sha256};
 use std::{fmt, io::Write, str};
 
-fn main() {
-    let mut work = Status::new(6);
+type Result<T> = anyhow::Result<T>;
+
+fn main() -> Result<()> {
+    let mut work = Status::new(6)?;
     // println!("p: {:#?}", work);
 
     work.swap();
     work.final_check();
+    Ok(())
 }
 
 /// All flash operations happen in terms of a given page size.  The page will be at least as large
@@ -45,6 +47,7 @@ const PAGE_SIZE: usize = 32;
 #[derive(Debug)]
 struct Slot {
     data: Vec<Page>,
+    index: usize,
 }
 
 /// A single page is some amount of data.
@@ -64,6 +67,7 @@ enum PageState {
     PartiallyErased,
 }
 
+#[derive(Debug)]
 struct PageLocation {
     slot: usize,
     index: usize,
@@ -77,6 +81,15 @@ struct Status {
     slot1: Slot,
     root: Vec<u8>,
     parity: Vec<u8>,
+
+    /// What step in the swap process are we on.
+    step: usize,
+
+    /// What step in the swap process should we stop at.
+    stop: Option<usize>,
+
+    /// When interrupted, this indicates where we expect the resume to continue.
+    resume: Option<PageLocation>,
 }
 
 impl Page {
@@ -116,10 +129,14 @@ impl Page {
     }
 
     /// Compute the digest of the given page.
-    fn digest(&self) -> Vec<u8> {
+    fn digest(&self, loc: PageLocation) -> Result<Vec<u8>> {
         let mut md = Sha256::new();
+        let mut buf = vec![];
+        buf.write_u32::<LittleEndian>(loc.slot as u32)?;
+        buf.write_u32::<LittleEndian>(loc.index as u32)?;
+        md.update(&buf[..]);
         md.update(&self.payload);
-        md.finalize().to_vec()
+        Ok(md.finalize().to_vec())
     }
 
     /// Normal read from the page. If the page is not in a state where this makes sense, it will
@@ -145,6 +162,12 @@ impl Page {
         self.payload.fill(0xFF);
     }
 
+    /// Partial erase.  We make no changes to the data, acting as if we are at the very beginning
+    /// of the operation.
+    fn partial_erase(&mut self) {
+        self.pstate = PageState::PartiallyErased;
+    }
+
     /// Write new contents to the page.  Will panic if the data isn't freshly erased.
     fn write(&mut self, buffer: &[u8]) {
         if let PageState::Erased = self.pstate {
@@ -153,6 +176,13 @@ impl Page {
         } else {
             panic!("Attempt to write to unerased flash page");
         }
+    }
+
+    /// Partial write.  The write will appear to be completed, but we will indicate it wasn't
+    /// actually finished.
+    fn partial_write(&mut self, buffer: &[u8]) {
+        self.write(buffer);
+        self.pstate = PageState::PartiallyWritten;
     }
 }
 
@@ -170,20 +200,23 @@ impl fmt::Display for Page {
 
 impl Slot {
     fn new(slot: usize, pages: usize) -> Slot {
-        let data = (0 .. pages).map(|i| {
-            Page::new(Some(PageLocation { slot, index: i }))
-        }).collect();
-        Slot { data }
+        let data = (0..pages)
+            .map(|i| Page::new(Some(PageLocation { slot, index: i })))
+            .collect();
+        Slot { data, index: slot }
     }
 
     /// Compute the Merkel root for the data in the slot.
     /// TODO: Don't return and copy result, twice
-    fn compute_root(&self) -> Vec<u8> {
+    fn compute_root(&self) -> Result<Vec<u8>> {
         let mut state = Sha256::new();
-        for b in &self.data {
-            state.update(&b.digest());
+        for (index, b) in self.data.iter().enumerate() {
+            state.update(&b.digest(PageLocation {
+                slot: self.index,
+                index,
+            })?);
         }
-        state.finalize().to_vec()
+        Ok(state.finalize().to_vec())
     }
 
     /// Compute a parity block for the entire image.
@@ -200,13 +233,21 @@ impl Slot {
 }
 
 impl Status {
-    fn new(size: usize) -> Status {
+    fn new(size: usize) -> Result<Status> {
         let slot0 = Slot::new(0, size);
         let slot1 = Slot::new(1, size);
-        let root = slot1.compute_root();
+        let root = slot1.compute_root()?;
         let parity = slot0.compute_parity();
 
-        Status { slot0, slot1, root, parity }
+        Ok(Status {
+            slot0,
+            slot1,
+            root,
+            parity,
+            step: 0,
+            stop: None,
+            resume: None,
+        })
     }
 
     fn swap(&mut self) {
@@ -217,25 +258,87 @@ impl Status {
         let mut abuf = vec![0u8; PAGE_SIZE];
         let mut bbuf = vec![0u8; PAGE_SIZE];
 
-        for sec in 0 .. self.slot0.data.len() {
-            let slot0 = &mut self.slot0.data[sec];
-            let slot1 = &mut self.slot1.data[sec];
+        for sec in 0..self.slot0.data.len() {
+            // We need to re-borrow this value each time we access the field.  This macro helps
+            // keep the reference short.
+            // Ideal would be to take an index parameter, but concat_idents is both unstable, and
+            // goes against hygiene.
+            macro_rules! slot {
+                ($name:ident) => { self.$name.data[sec] }
+            }
 
-            slot0.read(&mut abuf);
-            slot1.read(&mut bbuf);
+            slot!(slot0).read(&mut abuf);
+            slot!(slot1).read(&mut bbuf);
 
-            slot0.erase();
-            slot0.write(&mut bbuf);
-            slot1.erase();
-            slot1.write(&mut abuf);
+            // We consume 4 steps here.  One is before the erase, one after the write, and in both
+            // cases, we make sure that we restart after the write.
+
+            self.step += 1;
+            if self.is_stop() {
+                slot!(slot0).partial_erase();
+                self.resume = Some(PageLocation { slot: 0, index: sec });
+                return;
+            } else {
+                slot!(slot0).erase();
+            }
+
+            self.step += 1;
+            if self.is_stop() {
+                slot!(slot0).partial_write(&bbuf);
+                self.resume = Some(PageLocation { slot: 0, index: sec });
+                return;
+            } else {
+                slot!(slot0).write(&bbuf);
+            }
+
+            self.step += 1;
+            if self.is_stop() {
+                slot!(slot1).partial_erase();
+                self.resume = Some(PageLocation { slot: 1, index: sec });
+                return;
+            } else {
+                slot!(slot1).erase();
+            }
+
+            self.step += 1;
+            if self.is_stop() {
+                slot!(slot1).partial_write(&abuf);
+                self.resume = Some(PageLocation { slot: 1, index: sec });
+                return;
+            } else {
+                slot!(slot1).write(&abuf);
+            }
         }
+    }
+
+    /// Scan the device for the recovery point.  If we have enough RAM for
+    /// hashes for every block, we can be a little more robust, not having to
+    /// rely on the possibility of consecutive reads of the same data returning
+    /// something different.
+    fn find_recovery(&self) -> Result<PageLocation> {
+        unimplemented!()
     }
 
     /// Compute a final check to ensure that the given swap has completed.
     fn final_check(&self) {
-        for sec in 0 .. self.slot0.data.len() {
-            self.slot0.data[sec].check(PageLocation { slot: 1, index: sec });
-            self.slot1.data[sec].check(PageLocation { slot: 0, index: sec });
+        for sec in 0..self.slot0.data.len() {
+            self.slot0.data[sec].check(PageLocation {
+                slot: 1,
+                index: sec,
+            });
+            self.slot1.data[sec].check(PageLocation {
+                slot: 0,
+                index: sec,
+            });
+        }
+    }
+
+    /// Is our position such that we should stop.
+    fn is_stop(&self) -> bool {
+        if let Some(stop) = self.stop {
+            self.step > stop
+        } else {
+            false
         }
     }
 }
