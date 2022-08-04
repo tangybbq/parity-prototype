@@ -259,8 +259,6 @@ impl Status {
         for sec in 0..self.slots[0].data.len() {
             // We need to re-borrow this value each time we access the field.  This macro helps
             // keep the reference short.
-            // Ideal would be to take an index parameter, but concat_idents is both unstable, and
-            // goes against hygiene.
             macro_rules! slot {
                 ($index:literal) => { self.slots[$index].data[sec] }
             }
