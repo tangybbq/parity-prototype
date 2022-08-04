@@ -77,8 +77,7 @@ struct PageLocation {
 /// in memory.
 #[derive(Debug)]
 struct Status {
-    slot0: Slot,
-    slot1: Slot,
+    slots: [Slot; 2],
     root: Vec<u8>,
     parity: Vec<u8>,
 
@@ -240,8 +239,7 @@ impl Status {
         let parity = slot0.compute_parity();
 
         Ok(Status {
-            slot0,
-            slot1,
+            slots: [slot0, slot1],
             root,
             parity,
             step: 0,
@@ -252,61 +250,61 @@ impl Status {
 
     fn swap(&mut self) {
         // TODO: Support different sizes for the slots.
-        assert_eq!(self.slot0.data.len(), self.slot1.data.len());
+        assert_eq!(self.slots[0].data.len(), self.slots[1].data.len());
 
         // We need two buffers for the operation.
         let mut abuf = vec![0u8; PAGE_SIZE];
         let mut bbuf = vec![0u8; PAGE_SIZE];
 
-        for sec in 0..self.slot0.data.len() {
+        for sec in 0..self.slots[0].data.len() {
             // We need to re-borrow this value each time we access the field.  This macro helps
             // keep the reference short.
             // Ideal would be to take an index parameter, but concat_idents is both unstable, and
             // goes against hygiene.
             macro_rules! slot {
-                ($name:ident) => { self.$name.data[sec] }
+                ($index:literal) => { self.slots[$index].data[sec] }
             }
 
-            slot!(slot0).read(&mut abuf);
-            slot!(slot1).read(&mut bbuf);
+            slot!(0).read(&mut abuf);
+            slot!(1).read(&mut bbuf);
 
             // We consume 4 steps here.  One is before the erase, one after the write, and in both
             // cases, we make sure that we restart after the write.
 
             self.step += 1;
             if self.is_stop() {
-                slot!(slot0).partial_erase();
+                slot!(0).partial_erase();
                 self.resume = Some(PageLocation { slot: 0, index: sec });
                 return;
             } else {
-                slot!(slot0).erase();
+                slot!(0).erase();
             }
 
             self.step += 1;
             if self.is_stop() {
-                slot!(slot0).partial_write(&bbuf);
+                slot!(0).partial_write(&bbuf);
                 self.resume = Some(PageLocation { slot: 0, index: sec });
                 return;
             } else {
-                slot!(slot0).write(&bbuf);
+                slot!(0).write(&bbuf);
             }
 
             self.step += 1;
             if self.is_stop() {
-                slot!(slot1).partial_erase();
+                slot!(1).partial_erase();
                 self.resume = Some(PageLocation { slot: 1, index: sec });
                 return;
             } else {
-                slot!(slot1).erase();
+                slot!(1).erase();
             }
 
             self.step += 1;
             if self.is_stop() {
-                slot!(slot1).partial_write(&abuf);
+                slot!(1).partial_write(&abuf);
                 self.resume = Some(PageLocation { slot: 1, index: sec });
                 return;
             } else {
-                slot!(slot1).write(&abuf);
+                slot!(1).write(&abuf);
             }
         }
     }
@@ -321,12 +319,12 @@ impl Status {
 
     /// Compute a final check to ensure that the given swap has completed.
     fn final_check(&self) {
-        for sec in 0..self.slot0.data.len() {
-            self.slot0.data[sec].check(PageLocation {
+        for sec in 0..self.slots[0].data.len() {
+            self.slots[0].data[sec].check(PageLocation {
                 slot: 1,
                 index: sec,
             });
-            self.slot1.data[sec].check(PageLocation {
+            self.slots[1].data[sec].check(PageLocation {
                 slot: 0,
                 index: sec,
             });
