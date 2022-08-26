@@ -18,13 +18,27 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use sha2::{Digest, Sha256};
 use std::{fmt, io::Write, str};
 
+mod flash;
+
 type Result<T> = anyhow::Result<T>;
 
 fn main() -> Result<()> {
-    let mut work = Status::new(6)?;
-    // println!("p: {:#?}", work);
+    recovery(0)?;
+    Ok(())
+}
 
-    work.swap();
+/// Perform a swap with the given stopping point, and attempt recovery.
+fn recovery(stop: usize) -> Result<()> {
+    let mut work = Status::new(6)?;
+
+    work.stop = Some(stop);
+    if let SwapResult::Finished = work.swap() {
+        panic!("Too many steps for work to complete");
+    }
+
+    // TODO: Allow for multiple stopping points.
+    work.stop = None;
+    work.recover()?;
     work.final_check();
     Ok(())
 }
@@ -40,6 +54,12 @@ fn main() -> Result<()> {
 /// TLV/manifest) that can be placed in the slot.  TODO: it might be possible to only need one
 /// extra, if we can get away with only having parity for slot 1.
 const PAGE_SIZE: usize = 32;
+
+/// Indicates how a swap operation ran.
+enum SwapResult {
+    Finished,
+    Interrupted,
+}
 
 /// A slot consists of a number of pages of data.  The slot will have a size that is larger than
 /// the image.  There is also metadata associated with the slot about how large the image is and
@@ -122,7 +142,7 @@ impl Page {
             panic!("Page state is incorrect");
         }
 
-        if &self.payload[..] != &expected.payload[..] {
+        if self.payload[..] != expected.payload[..] {
             panic!("Page contents is incorrect");
         }
     }
@@ -248,7 +268,7 @@ impl Status {
         })
     }
 
-    fn swap(&mut self) {
+    fn swap(&mut self) -> SwapResult {
         // TODO: Support different sizes for the slots.
         assert_eq!(self.slots[0].data.len(), self.slots[1].data.len());
 
@@ -260,7 +280,9 @@ impl Status {
             // We need to re-borrow this value each time we access the field.  This macro helps
             // keep the reference short.
             macro_rules! slot {
-                ($index:literal) => { self.slots[$index].data[sec] }
+                ($index:literal) => {
+                    self.slots[$index].data[sec]
+                };
             }
 
             slot!(0).read(&mut abuf);
@@ -272,8 +294,11 @@ impl Status {
             self.step += 1;
             if self.is_stop() {
                 slot!(0).partial_erase();
-                self.resume = Some(PageLocation { slot: 0, index: sec });
-                return;
+                self.resume = Some(PageLocation {
+                    slot: 0,
+                    index: sec,
+                });
+                return SwapResult::Interrupted;
             } else {
                 slot!(0).erase();
             }
@@ -281,8 +306,11 @@ impl Status {
             self.step += 1;
             if self.is_stop() {
                 slot!(0).partial_write(&bbuf);
-                self.resume = Some(PageLocation { slot: 0, index: sec });
-                return;
+                self.resume = Some(PageLocation {
+                    slot: 0,
+                    index: sec,
+                });
+                return SwapResult::Interrupted;
             } else {
                 slot!(0).write(&bbuf);
             }
@@ -290,8 +318,11 @@ impl Status {
             self.step += 1;
             if self.is_stop() {
                 slot!(1).partial_erase();
-                self.resume = Some(PageLocation { slot: 1, index: sec });
-                return;
+                self.resume = Some(PageLocation {
+                    slot: 1,
+                    index: sec,
+                });
+                return SwapResult::Interrupted;
             } else {
                 slot!(1).erase();
             }
@@ -299,12 +330,24 @@ impl Status {
             self.step += 1;
             if self.is_stop() {
                 slot!(1).partial_write(&abuf);
-                self.resume = Some(PageLocation { slot: 1, index: sec });
-                return;
+                self.resume = Some(PageLocation {
+                    slot: 1,
+                    index: sec,
+                });
+                return SwapResult::Interrupted;
             } else {
                 slot!(1).write(&abuf);
             }
         }
+
+        SwapResult::Finished
+    }
+
+    /// Perform a startup recovery.  Finds the recovery point, and continues the swapping.
+    fn recover(&mut self) -> Result<()> {
+        let loc = self.find_recovery()?;
+        println!("loc: {:?}", loc);
+        Ok(())
     }
 
     /// Scan the device for the recovery point.  If we have enough RAM for
