@@ -24,7 +24,8 @@ pub const PAGE_SIZE: usize = 32;
 /// as just a different flash device.
 #[derive(Debug)]
 pub struct Slot {
-    data: Vec<Page>,
+    // TODO: This shouldn't need to be public.
+    pub data: Vec<Page>,
 }
 
 impl Slot {
