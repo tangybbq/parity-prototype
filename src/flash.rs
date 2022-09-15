@@ -12,13 +12,60 @@
 //! enable some optimizations where status can be written incrementally in the last page instead of
 //! requiring its own page(s).
 
+use crate::pdump::HexDumper;
 use crate::Result;
 use anyhow::anyhow;
-use std::io::Write;
+use std::{
+    fmt,
+    io::Write,
+};
 
 /// For this prototype, we will make the page size a compile-time constant.  This can be abstracted
 /// later, if this code is ever used in a real device.
 pub const PAGE_SIZE: usize = 32;
+
+/// Flash memory contains two slots, a primary and an upgrade, these are conveniently referred to
+/// as 0 and 1.
+#[derive(Debug)]
+pub struct Flash {
+    pub slots: [Slot; 2],
+}
+
+impl Flash {
+    pub fn build(sizes: [usize; 2], isizes: [usize; 2]) -> Result<Flash> {
+        let mut buf = vec![0xFFu8; PAGE_SIZE];
+
+        let mut s0 = Slot::new(sizes[0]);
+        let mut s1 = Slot::new(sizes[1]);
+
+        for p in 0 .. isizes[0] {
+            Page::fill(&mut buf, 0, p);
+            s0.data[p].erase()?;
+            s0.data[p].write(&buf)?;
+        }
+
+        for p in 0 .. isizes[1] {
+            Page::fill(&mut buf, 1, p);
+            s1.data[p].erase()?;
+            s1.data[p].write(&buf)?;
+        }
+
+        Ok(Flash{ slots: [s0, s1] })
+    }
+}
+
+/// Nicely print flash contents.
+impl fmt::Display for Flash {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for slot in 0..2 {
+            for (pnum, page) in self.slots[slot].data.iter().enumerate() {
+                writeln!(f, "Slot {}, page {:4}, {:?}", slot, pnum, page.pstate)?;
+                HexDumper(&page.payload).fmt_prefix(f, "    ")?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The flash consists of a number of pages of data.  In this usage, we will treat each partition
 /// as just a different flash device.

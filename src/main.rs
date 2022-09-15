@@ -17,13 +17,17 @@
 // use sha2::{Digest, Sha256};
 // use std::io::Write;
 
-// use flash::{PAGE_SIZE, Slot};
+use flash::{Flash};
 
 mod flash;
+mod pdump;
 
 type Result<T> = anyhow::Result<T>;
 
 fn main() -> Result<()> {
+    let flash = Flash::build([16, 16], [14, 13])?;
+    let _ = flash;
+    println!("flash: {}", flash);
     // recovery(0)?;
     Ok(())
 }
